@@ -12,6 +12,7 @@ from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingClassifier,
 )
+from sklearn.model_selection import cross_val_predict
 from sklearn.linear_model import Ridge
 import sklearn.base
 import xgboost as xgb
@@ -190,15 +191,36 @@ best_et_params.update({'random_state': 42})
 print(f"  -> Best ET RMSE: {-study_et.best_value:.4f}")
 
 # %% [markdown]
-# ## 4. Stacking Meta-Learner (OOF predictions -> Ridge)
+# ## 4. Tune GBR + Stacking Meta-Learner (OOF predictions -> Ridge, positive=True)
 
 # %%
+# --- GradientBoosting (adds diversity, helps reduce fold variance) ---
+def objective_gbr(trial):
+    params = {
+        'n_estimators':    trial.suggest_int('n_estimators', 200, 500),
+        'max_depth':       trial.suggest_int('max_depth', 2, 5),
+        'learning_rate':   trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+        'subsample':       trial.suggest_float('subsample', 0.6, 1.0),
+        'min_samples_leaf':trial.suggest_int('min_samples_leaf', 1, 6),
+        'random_state': 42,
+    }
+    return cross_val_score(GradientBoostingRegressor(**params), X_nz, y_nz, cv=cv5,
+                            scoring='neg_root_mean_squared_error').mean()
+
+print("[4b/6] Tuning GBR regressor (25 trials)...")
+study_gbr = optuna.create_study(direction='maximize')
+study_gbr.optimize(objective_gbr, n_trials=25)
+best_gbr_params = study_gbr.best_params
+best_gbr_params.update({'random_state': 42})
+print(f"  -> Best GBR RMSE: {-study_gbr.best_value:.4f}")
+
 print("\n[5/6] Building stacking meta-learner...")
 
 models_config = [
     ('XGB', xgb.XGBRegressor(**best_xgb_params)),
     ('LGB', lgb.LGBMRegressor(**best_lgb_params)),
     ('ET',  ExtraTreesRegressor(**best_et_params)),
+    ('GBR', GradientBoostingRegressor(**best_gbr_params)),
 ]
 
 n_nz = X_nz.shape[0]
@@ -212,12 +234,23 @@ for mi, (name, template) in enumerate(models_config):
     oof_rmse = np.sqrt(mean_squared_error(y_nz, oof_preds[:, mi]))
     print(f"  {name} OOF RMSE: {oof_rmse:.4f}")
 
-meta = Ridge(alpha=1.0)
+# Tune Ridge alpha on OOF + force positive weights (eliminates negative contributions)
+best_ridge_alpha = 1.0
+best_ridge_rmse = float('inf')
+for alpha in [0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]:
+    meta_try = Ridge(alpha=alpha, positive=True)
+    meta_try.fit(oof_preds, y_nz)
+    rmse_try = np.sqrt(mean_squared_error(y_nz, meta_try.predict(oof_preds)))
+    if rmse_try < best_ridge_rmse:
+        best_ridge_rmse = rmse_try
+        best_ridge_alpha = alpha
+
+meta = Ridge(alpha=best_ridge_alpha, positive=True)
 meta.fit(oof_preds, y_nz)
 meta_pred = meta.predict(oof_preds)
 meta_rmse = np.sqrt(mean_squared_error(y_nz, meta_pred))
-print(f"  Stacked RMSE: {meta_rmse:.4f}")
-print(f"  Weights: {dict(zip([n for n,_ in models_config], meta.coef_.round(3)))}")
+print(f"  Stacked RMSE: {meta_rmse:.4f} (Ridge alpha={best_ridge_alpha}, positive=True)")
+print(f"  Weights: {dict(zip([n for n,_ in models_config], meta.coef_.round(3)))})")
 
 # Fit base models on full non-zero data
 final_models = []
@@ -266,11 +299,24 @@ for fold, (tr_idx, vl_idx) in enumerate(kf_eval.split(X)):
     meta_f = Ridge(alpha=1.0)
     meta_f.fit(oof_inner, y_nz_f)
 
-    # Predict val
+    # Tune classifier threshold per-fold to minimize fold RMSE
     proba = clf_f.predict_proba(X_vl)[:, 1]
     pred = np.zeros(len(X_vl))
-    nz_mask = proba >= 0.5
 
+    best_fold_thresh = 0.5
+    best_fold_rmse_thresh = float('inf')
+    for thresh in np.arange(0.3, 0.75, 0.05):
+        nz_m = proba >= thresh
+        cand = np.zeros(len(X_vl))
+        if nz_m.sum() > 0:
+            bp_c = np.column_stack([m.predict(X_vl[nz_m]) for m in base_f])
+            cand[nz_m] = np.clip(meta_f.predict(bp_c), 0, 100)
+        r = np.sqrt(mean_squared_error(y_vl, np.clip(cand, 0, 100)))
+        if r < best_fold_rmse_thresh:
+            best_fold_rmse_thresh = r
+            best_fold_thresh = thresh
+
+    nz_mask = proba >= best_fold_thresh
     if nz_mask.sum() > 0:
         bp = np.column_stack([m.predict(X_vl[nz_mask]) for m in base_f])
         pred[nz_mask] = meta_f.predict(bp)

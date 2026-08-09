@@ -2,21 +2,18 @@
 # # Predictive Modeling Optimization Challenge - Model Training
 # 
 # ## 1. Introduction
-# In this notebook, we build a robust predictive model to predict the `overall_yield` of Product B. Following physical constraints and continuous process behavior, we utilize physics-informed feature engineering and smooth regressors (Extra Trees, Gaussian Processes, SVR).
+# In this notebook, we build a robust predictive model to predict the `overall_yield` of Product B. Following physical constraints and the bimodal nature of the yield (success vs failure cliffs), we utilize a Two-Stage Pipeline (Classifier + Regressor), 7 physics-informed features, and a dynamically weighted ensemble.
 
 # %%
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, KFold, cross_val_score
+from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error
-from sklearn.ensemble import ExtraTreesRegressor, VotingRegressor
-from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.gaussian_process.kernels import Matern, WhiteKernel, ConstantKernel
-from sklearn.svm import SVR
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, GradientBoostingClassifier, HistGradientBoostingRegressor
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
 
 sns.set_theme(style="whitegrid")
 plt.rcParams["figure.figsize"] = (10, 6)
@@ -39,145 +36,161 @@ print(df_test.head())
 def feature_engineering(df):
     df_engineered = df.copy()
     
-    # 1. Residence Time Proxy (tau) = length / flow_rate
-    df_engineered['residence_time_tau'] = df_engineered['length_m'] / df_engineered['flow_rate_L_min']
+    # 1. Residence Time: Core reactor variable
+    df_engineered['residence_time'] = df_engineered['length_m'] / df_engineered['flow_rate_L_min']
     
-    # 2. Arrhenius Terms = exp(-Constant / T)
-    # Using a scaling factor (e.g., 1000) so the exp() values don't underflow to 0
-    df_engineered['arrhenius_jacket'] = np.exp(-1000.0 / df_engineered['jacket_temperature_K'])
-    df_engineered['arrhenius_inlet'] = np.exp(-1000.0 / df_engineered['inlet_temperature_K'])
+    # 2. Temperature Delta: Heat exchange driving force
+    df_engineered['temp_delta'] = df_engineered['jacket_temperature_K'] - df_engineered['inlet_temperature_K']
     
-    # 3. Heat Input Proxy = delta_T * tau
-    df_engineered['heat_input_proxy'] = (df_engineered['jacket_temperature_K'] - df_engineered['inlet_temperature_K']) * df_engineered['residence_time_tau']
+    # 3. Arrhenius Terms: exp(-5000 / T)
+    df_engineered['arrhenius_inlet'] = np.exp(-5000.0 / df_engineered['inlet_temperature_K'])
+    df_engineered['arrhenius_jacket'] = np.exp(-5000.0 / df_engineered['jacket_temperature_K'])
     
-    # 4. Initial Reactant Mass Rate = concentration * flow_rate
-    df_engineered['initial_mass_rate'] = df_engineered['concentration_mol_L'] * df_engineered['flow_rate_L_min']
+    # 4. Conversion Capacity
+    df_engineered['conc_x_residence'] = df_engineered['concentration_mol_L'] * df_engineered['residence_time']
+    
+    # 5. Volume Throughput
+    df_engineered['volume_throughput'] = df_engineered['length_m'] * df_engineered['flow_rate_L_min']
+    
+    # 6. Residence Time Squared (over-cooking effect)
+    df_engineered['residence_time_sq'] = df_engineered['residence_time'] ** 2
     
     return df_engineered
 
-X_train_raw = df_train.drop(columns=['overall_yield'])
+X_raw = df_train.drop(columns=['overall_yield'])
 y = df_train['overall_yield']
 X_test_raw = df_test.copy()
 
-X = feature_engineering(X_train_raw)
+X = feature_engineering(X_raw)
 X_test_final = feature_engineering(X_test_raw)
 
-# Split for local validation
-X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
-
-print(f"Train shapes: X={X_train.shape}, y={y_train.shape}")
-print(f"Val shapes: X={X_val.shape}, y={y_val.shape}")
-
 # %% [markdown]
-# ## 4. Smooth Ensemble Modeling
-# We will combine Extra Trees, Gaussian Process Regressor, and SVR to create a robust Voting Regressor. These models map continuous surfaces better than standard step-function boosting models.
-# All inputs will be StandardScaled, as GPR and SVR require normalized inputs to function properly.
+# ## 4. Two-Stage Bimodal Pipeline & Weighted Ensemble
+# We implement a custom 5-Fold Cross-Validation pipeline. For each fold, we:
+# 1. Train a Classifier on (yield > 1.0)
+# 2. Train regressors only on successful reactions (yield > 1.0)
+# 3. Weight the regressors by inverse RMSE on the holdout fold
+# 4. Soft blend: Final Pred = Ensemble_Pred * Classifier_Prob
 
 # %%
-# Define individual models
-et_model = Pipeline([
-    ('scaler', StandardScaler()),
-    ('et', ExtraTreesRegressor(n_estimators=300, max_depth=8, random_state=42, min_samples_split=4))
-])
-
-# Gaussian Process with a smooth Matern kernel + noise
-kernel = ConstantKernel(1.0) * Matern(length_scale=1.0, nu=1.5) + WhiteKernel(noise_level=1)
-gp_model = Pipeline([
-    ('scaler', StandardScaler()),
-    ('gp', GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=5, random_state=42, normalize_y=True))
-])
-
-svr_model = Pipeline([
-    ('scaler', StandardScaler()),
-    ('svr', SVR(kernel='rbf', C=50, epsilon=0.1, gamma='scale'))
-])
-
-# Create an Ensemble Model
-ensemble_model = VotingRegressor([
-    ('et', et_model),
-    ('gp', gp_model),
-    ('svr', svr_model)
-])
-
-# Cross-validation score
 kf = KFold(n_splits=5, shuffle=True, random_state=42)
 
-# Custom evaluation that strictly bounds predictions to [0, 100]
-def bounded_rmse_cv(model, X_full, y_full, kfold):
-    rmses = []
-    for train_idx, test_idx in kfold.split(X_full):
-        X_tr, X_te = X_full.iloc[train_idx], X_full.iloc[test_idx]
-        y_tr, y_te = y_full.iloc[train_idx], y_full.iloc[test_idx]
+oof_preds = np.zeros(len(X))
+models_per_fold = []
+weights_per_fold = []
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+    X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
+    X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
+    
+    # Stage 1: Classifier targets
+    y_train_class = (y_train > 1.0).astype(int)
+    
+    clf = GradientBoostingClassifier(n_estimators=150, max_depth=3, random_state=42)
+    clf.fit(X_train, y_train_class)
+    
+    # Stage 2: Regressors on non-zero subset
+    mask = y_train > 1.0
+    X_train_sub = X_train[mask]
+    y_train_sub = y_train[mask]
+    
+    regressors = [
+        GradientBoostingRegressor(n_estimators=150, max_depth=4, random_state=42, subsample=0.8),
+        HistGradientBoostingRegressor(max_iter=150, max_depth=4, random_state=42),
+        RandomForestRegressor(n_estimators=150, max_depth=5, random_state=42)
+    ]
+    
+    fitted_regs = []
+    reg_rmses = []
+    
+    for reg in regressors:
+        reg.fit(X_train_sub, y_train_sub)
+        fitted_regs.append(reg)
         
-        model.fit(X_tr, y_tr)
-        preds = model.predict(X_te)
+        # Evaluate to find weights using validation set
+        # Note: We evaluate RMSE on the full val set using the two-stage logic for accurate weights
+        p_success = clf.predict_proba(X_val)[:, 1]
+        raw_preds = np.clip(reg.predict(X_val), 0.0, 100.0)
+        final_preds = raw_preds * p_success
+        fold_rmse = np.sqrt(mean_squared_error(y_val, final_preds))
+        reg_rmses.append(fold_rmse)
         
-        # Bounding transformation
-        preds_clipped = np.clip(preds, 0.0, 100.0)
-        rmses.append(np.sqrt(mean_squared_error(y_te, preds_clipped)))
-    return np.mean(rmses)
+    # Inverse RMSE weighting
+    inv_rmses = [1.0 / (rmse + 1e-6) for rmse in reg_rmses]
+    weights = [w / sum(inv_rmses) for w in inv_rmses]
+    
+    # Generate OOF predictions for this fold
+    p_success_val = clf.predict_proba(X_val)[:, 1]
+    val_ens_preds = np.zeros(len(X_val))
+    for reg, w in zip(fitted_regs, weights):
+        val_ens_preds += w * np.clip(reg.predict(X_val), 0.0, 100.0)
+        
+    oof_preds[val_idx] = val_ens_preds * p_success_val
+    
+    models_per_fold.append((clf, fitted_regs))
+    weights_per_fold.append(weights)
 
-cv_rmse = bounded_rmse_cv(ensemble_model, X, y, kf)
-
-print(f"Cross-Validation RMSE (Bounded Ensemble): {cv_rmse:.4f}")
-
-# Fit on training fold and validate
-ensemble_model.fit(X_train, y_train)
-y_val_pred_raw = ensemble_model.predict(X_val)
-y_val_pred = np.clip(y_val_pred_raw, 0.0, 100.0)
-
-val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
-print(f"Hold-out Validation RMSE: {val_rmse:.4f}")
+cv_rmse = np.sqrt(mean_squared_error(y, oof_preds))
+print(f"5-Fold CV RMSE (Two-Stage Pipeline): {cv_rmse:.4f}")
 
 # %% [markdown]
 # ## 5. Model Evaluation & Visualization
 
 # %%
 plt.figure(figsize=(8, 8))
-plt.scatter(y_val, y_val_pred, alpha=0.7, color='b')
+plt.scatter(y, oof_preds, alpha=0.7, color='b')
 plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
 plt.xlabel('True Yield')
-plt.ylabel('Predicted Yield (Bounded)')
-plt.title('True vs Predicted Yield (Physics-Informed Ensemble)')
+plt.ylabel('Predicted Yield (Two-Stage CV)')
+plt.title('True vs Predicted Yield (Out-of-Fold)')
 plt.savefig('true_vs_predicted_yield.png', dpi=300)
 plt.close()
 
 # %% [markdown]
-# ### Feature Importance (From Extra Trees)
+# ### Feature Importance (From average GBR models)
 
 # %%
-# Extract feature importances from the ExtraTrees model in the pipeline
-et_model.fit(X, y)
-feature_importance = et_model.named_steps['et'].feature_importances_
-sorted_idx = np.argsort(feature_importance)
+# Average feature importances across folds
+avg_importance = np.zeros(X.shape[1])
+for _, fitted_regs in models_per_fold:
+    avg_importance += fitted_regs[0].feature_importances_ / 5.0
+
+sorted_idx = np.argsort(avg_importance)
 
 plt.figure(figsize=(10, 6))
-plt.barh(range(len(sorted_idx)), feature_importance[sorted_idx], align='center')
+plt.barh(range(len(sorted_idx)), avg_importance[sorted_idx], align='center')
 plt.yticks(range(len(sorted_idx)), np.array(X.columns)[sorted_idx])
-plt.xlabel('Feature Importance')
-plt.title('Extra Trees - Feature Importance')
+plt.xlabel('Average Feature Importance')
+plt.title('GBR Regressor - Feature Importance')
 plt.savefig('feature_importance.png', dpi=300)
 plt.close()
 
 # %% [markdown]
-# ## 6. Retrain on Full Data and Predict for Test Set
+# ## 6. Predict for Test Set
+# We average the predictions across all 5 folds to create a very robust final test prediction.
 
 # %%
-# Fit the ensemble model on ALL available training data
-ensemble_model.fit(X, y)
+final_test_preds = np.zeros(len(X_test_final))
 
-# Predict on test set
-final_predictions_raw = ensemble_model.predict(X_test_final)
+for fold, (clf, fitted_regs) in enumerate(models_per_fold):
+    weights = weights_per_fold[fold]
+    p_success = clf.predict_proba(X_test_final)[:, 1]
+    
+    fold_ens_preds = np.zeros(len(X_test_final))
+    for reg, w in zip(fitted_regs, weights):
+        fold_ens_preds += w * np.clip(reg.predict(X_test_final), 0.0, 100.0)
+        
+    final_test_preds += (fold_ens_preds * p_success) / 5.0
 
-# Clip final predictions to physical bounds [0, 100]
-final_predictions = np.clip(final_predictions_raw, 0.0, 100.0)
+# Clip bounds just to be safe
+final_test_preds = np.clip(final_test_preds, 0.0, 100.0)
 
 # %% [markdown]
 # ## 7. Prepare Submission File
 # Generate the submission CSV containing exactly 50 rows and one column `overall_yield`, rounded to 3 decimal places.
 
 # %%
-submission = pd.DataFrame({'overall_yield': np.round(final_predictions, 3)})
+submission = pd.DataFrame({'overall_yield': np.round(final_test_preds, 3)})
 submission.to_csv('Ctrl+Alt+Achieve.csv', index=False)
 
 print("Submission saved successfully as Ctrl+Alt+Achieve.csv!")

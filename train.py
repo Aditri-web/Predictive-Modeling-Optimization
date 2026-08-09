@@ -1,122 +1,343 @@
 # %% [markdown]
-# # Predictive Modeling Optimization Challenge - Model Training
-# 
-# ## 1. Introduction
-# In this notebook, we build a predictive model to predict the `overall_yield` of Product B based on the operating conditions. We will use a Gradient Boosting model (XGBoost/HistGradientBoosting) which is well-suited for capturing complex non-linear relationships in tabular data.
+# # Predictive Modeling Optimization - V3 Lean (Fast + Aggressive RMSE)
 
 # %%
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV, KFold
+from sklearn.model_selection import KFold, cross_val_score, StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import (
+    GradientBoostingRegressor,
+    RandomForestRegressor,
+    ExtraTreesRegressor,
+    GradientBoostingClassifier,
+)
+from sklearn.linear_model import Ridge
+import sklearn.base
+import xgboost as xgb
+import lightgbm as lgb
+import optuna
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 sns.set_theme(style="whitegrid")
 plt.rcParams["figure.figsize"] = (10, 6)
 
-# %% [markdown]
-# ## 2. Load the Datasets
-
 # %%
 df_train = pd.read_csv("train_dataset.csv")
-df_test = pd.read_csv("test_dataset.csv")
-
-print(df_train.head())
-print(df_test.head())
+df_test  = pd.read_csv("test_dataset.csv")
+print("Train:", df_train.shape, "| Test:", df_test.shape)
 
 # %% [markdown]
-# ## 3. Data Preparation
-# Split the training data into features (X) and target (y).
+# ## 1. Feature Engineering
 
 # %%
-X = df_train.drop(columns=['overall_yield'])
-y = df_train['overall_yield']
-X_test_final = df_test.copy()
+def engineer_features(df):
+    df = df.copy()
+    flow = df['flow_rate_L_min']
+    conc = df['concentration_mol_L']
+    t_in = df['inlet_temperature_K']
+    t_jk = df['jacket_temperature_K']
+    length = df['length_m']
 
-# Split train data into train and validation sets
-X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+    df['residence_time']      = length / flow
+    df['temp_delta']          = t_jk - t_in
+    df['abs_temp_delta']      = np.abs(t_jk - t_in)
+    df['temp_ratio']          = t_jk / t_in
+    df['temp_mean']           = (t_jk + t_in) / 2
+    df['arrhenius_inlet']     = np.exp(-5000.0 / t_in)
+    df['arrhenius_jacket']    = np.exp(-5000.0 / t_jk)
+    df['arrhenius_mean']      = np.exp(-5000.0 / df['temp_mean'])
+    df['arrhenius_delta']     = df['arrhenius_jacket'] - df['arrhenius_inlet']
+    df['conc_x_residence']    = conc * df['residence_time']
+    df['volume_throughput']   = flow * length
+    df['conc_x_flow']         = conc * flow
+    df['flow_x_temp_delta']   = flow * df['temp_delta']
+    df['length_x_temp_delta'] = length * df['temp_delta']
+    df['residence_time_sq']   = df['residence_time'] ** 2
+    df['residence_time_log']  = np.log1p(df['residence_time'])
+    df['temp_delta_sq']       = df['temp_delta'] ** 2
+    df['conc_sq']             = conc ** 2
+    df['flow_inv']            = 1.0 / flow
+    df['damkohler_proxy']     = df['arrhenius_mean'] * length / flow
+    return df
 
-print(f"Train shapes: X={X_train.shape}, y={y_train.shape}")
-print(f"Val shapes: X={X_val.shape}, y={y_val.shape}")
+df_train_feat = engineer_features(df_train.drop(columns=['overall_yield']))
+df_train_feat['overall_yield'] = df_train['overall_yield'].values
+df_test_feat = engineer_features(df_test)
+
+feature_cols = [c for c in df_train_feat.columns if c != 'overall_yield']
+X = df_train_feat[feature_cols].values
+y = df_train_feat['overall_yield'].values
+X_test_final = df_test_feat[feature_cols].values
+feature_names = feature_cols
+print(f"{len(feature_cols)} features engineered")
 
 # %% [markdown]
-# ## 4. Model Selection and Training
-# Given the small dataset (150 rows), a Random Forest and Gradient Boosting model are strong candidates. We'll train a GradientBoostingRegressor.
+# ## 2. Stage 1 - Classifier (zero vs non-zero)
 
 # %%
-# Initialize model
-gb_model = GradientBoostingRegressor(
-    n_estimators=200,
-    learning_rate=0.05,
-    max_depth=4,
-    random_state=42,
-    subsample=0.8
-)
+ZERO_THRESHOLD = 0.2
+y_binary = (y > ZERO_THRESHOLD).astype(int)
+print(f"Zero: {(y_binary==0).sum()} | Non-zero: {(y_binary==1).sum()}")
 
-# Train the model
-gb_model.fit(X_train, y_train)
+def objective_clf(trial):
+    params = {
+        'n_estimators':    trial.suggest_int('n_estimators', 100, 500),
+        'max_depth':       trial.suggest_int('max_depth', 3, 7),
+        'learning_rate':   trial.suggest_float('learning_rate', 0.01, 0.2, log=True),
+        'subsample':       trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree':trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'min_child_weight':trial.suggest_int('min_child_weight', 1, 10),
+        'reg_alpha':       trial.suggest_float('reg_alpha', 1e-3, 10, log=True),
+        'reg_lambda':      trial.suggest_float('reg_lambda', 1e-3, 10, log=True),
+        'use_label_encoder': False, 'eval_metric': 'logloss',
+        'random_state': 42, 'verbosity': 0,
+    }
+    model = xgb.XGBClassifier(**params)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    return cross_val_score(model, X, y_binary, cv=cv, scoring='accuracy').mean()
 
-# Predict on validation set
-y_val_pred = gb_model.predict(X_val)
-val_rmse = np.sqrt(mean_squared_error(y_val, y_val_pred))
-print(f"Validation RMSE: {val_rmse:.4f}")
+print("\n[1/6] Tuning classifier (30 trials)...")
+study_clf = optuna.create_study(direction='maximize')
+study_clf.optimize(objective_clf, n_trials=30)
+best_clf_params = study_clf.best_params
+best_clf_params.update({'use_label_encoder': False, 'eval_metric': 'logloss',
+                        'random_state': 42, 'verbosity': 0})
+print(f"  -> Best accuracy: {study_clf.best_value:.4f}")
+
+clf = xgb.XGBClassifier(**best_clf_params)
+clf.fit(X, y_binary)
 
 # %% [markdown]
-# ## 5. Model Evaluation & Visualization
-# Let's visualize the True vs Predicted yields on the validation set.
+# ## 3. Stage 2 - Tune regressors on non-zero subset
 
 # %%
+mask_nz = y > ZERO_THRESHOLD
+X_nz = X[mask_nz]
+y_nz = y[mask_nz]
+cv5 = KFold(n_splits=5, shuffle=True, random_state=42)
+print(f"\nNon-zero samples: {X_nz.shape[0]}")
+
+# --- XGBoost ---
+def objective_xgb(trial):
+    params = {
+        'n_estimators':    trial.suggest_int('n_estimators', 200, 600),
+        'max_depth':       trial.suggest_int('max_depth', 3, 7),
+        'learning_rate':   trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+        'subsample':       trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree':trial.suggest_float('colsample_bytree', 0.4, 1.0),
+        'min_child_weight':trial.suggest_int('min_child_weight', 1, 12),
+        'reg_alpha':       trial.suggest_float('reg_alpha', 1e-4, 10, log=True),
+        'reg_lambda':      trial.suggest_float('reg_lambda', 1e-4, 10, log=True),
+        'gamma':           trial.suggest_float('gamma', 0, 3),
+        'random_state': 42, 'verbosity': 0,
+    }
+    return cross_val_score(xgb.XGBRegressor(**params), X_nz, y_nz, cv=cv5,
+                            scoring='neg_root_mean_squared_error').mean()
+
+print("[2/6] Tuning XGBoost regressor (40 trials)...")
+study_xgb = optuna.create_study(direction='maximize')
+study_xgb.optimize(objective_xgb, n_trials=40)
+best_xgb_params = study_xgb.best_params
+best_xgb_params.update({'random_state': 42, 'verbosity': 0})
+print(f"  -> Best XGB RMSE: {-study_xgb.best_value:.4f}")
+
+# --- LightGBM ---
+def objective_lgb(trial):
+    params = {
+        'n_estimators':      trial.suggest_int('n_estimators', 200, 600),
+        'max_depth':         trial.suggest_int('max_depth', 3, 8),
+        'learning_rate':     trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+        'subsample':         trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.4, 1.0),
+        'min_child_samples': trial.suggest_int('min_child_samples', 3, 15),
+        'reg_alpha':         trial.suggest_float('reg_alpha', 1e-4, 10, log=True),
+        'reg_lambda':        trial.suggest_float('reg_lambda', 1e-4, 10, log=True),
+        'num_leaves':        trial.suggest_int('num_leaves', 15, 50),
+        'random_state': 42, 'verbose': -1,
+    }
+    return cross_val_score(lgb.LGBMRegressor(**params), X_nz, y_nz, cv=cv5,
+                            scoring='neg_root_mean_squared_error').mean()
+
+print("[3/6] Tuning LightGBM regressor (40 trials)...")
+study_lgb = optuna.create_study(direction='maximize')
+study_lgb.optimize(objective_lgb, n_trials=40)
+best_lgb_params = study_lgb.best_params
+best_lgb_params.update({'random_state': 42, 'verbose': -1})
+print(f"  -> Best LGB RMSE: {-study_lgb.best_value:.4f}")
+
+# --- ExtraTrees ---
+def objective_et(trial):
+    params = {
+        'n_estimators':    trial.suggest_int('n_estimators', 200, 600),
+        'max_depth':       trial.suggest_int('max_depth', 5, 15),
+        'min_samples_leaf':trial.suggest_int('min_samples_leaf', 1, 6),
+        'max_features':    trial.suggest_float('max_features', 0.3, 1.0),
+        'random_state': 42,
+    }
+    return cross_val_score(ExtraTreesRegressor(**params), X_nz, y_nz, cv=cv5,
+                            scoring='neg_root_mean_squared_error').mean()
+
+print("[4/6] Tuning ExtraTrees regressor (25 trials)...")
+study_et = optuna.create_study(direction='maximize')
+study_et.optimize(objective_et, n_trials=25)
+best_et_params = study_et.best_params
+best_et_params.update({'random_state': 42})
+print(f"  -> Best ET RMSE: {-study_et.best_value:.4f}")
+
+# %% [markdown]
+# ## 4. Stacking Meta-Learner (OOF predictions -> Ridge)
+
+# %%
+print("\n[5/6] Building stacking meta-learner...")
+
+models_config = [
+    ('XGB', xgb.XGBRegressor(**best_xgb_params)),
+    ('LGB', lgb.LGBMRegressor(**best_lgb_params)),
+    ('ET',  ExtraTreesRegressor(**best_et_params)),
+]
+
+n_nz = X_nz.shape[0]
+oof_preds = np.zeros((n_nz, len(models_config)))
+
+for mi, (name, template) in enumerate(models_config):
+    for tr_idx, vl_idx in cv5.split(X_nz):
+        m = sklearn.base.clone(template)
+        m.fit(X_nz[tr_idx], y_nz[tr_idx])
+        oof_preds[vl_idx, mi] = m.predict(X_nz[vl_idx])
+    oof_rmse = np.sqrt(mean_squared_error(y_nz, oof_preds[:, mi]))
+    print(f"  {name} OOF RMSE: {oof_rmse:.4f}")
+
+meta = Ridge(alpha=1.0)
+meta.fit(oof_preds, y_nz)
+meta_pred = meta.predict(oof_preds)
+meta_rmse = np.sqrt(mean_squared_error(y_nz, meta_pred))
+print(f"  Stacked RMSE: {meta_rmse:.4f}")
+print(f"  Weights: {dict(zip([n for n,_ in models_config], meta.coef_.round(3)))}")
+
+# Fit base models on full non-zero data
+final_models = []
+for name, template in models_config:
+    m = sklearn.base.clone(template)
+    m.fit(X_nz, y_nz)
+    final_models.append((name, m))
+
+# %% [markdown]
+# ## 5. End-to-End 5-Fold CV Evaluation
+
+# %%
+print("\n[6/6] Final end-to-end evaluation...")
+
+kf_eval = KFold(n_splits=5, shuffle=True, random_state=42)
+fold_rmses = []
+y_val_all, y_pred_all = [], []
+
+for fold, (tr_idx, vl_idx) in enumerate(kf_eval.split(X)):
+    X_tr, X_vl = X[tr_idx], X[vl_idx]
+    y_tr, y_vl = y[tr_idx], y[vl_idx]
+
+    # Stage 1: classifier
+    y_tr_bin = (y_tr > ZERO_THRESHOLD).astype(int)
+    clf_f = xgb.XGBClassifier(**best_clf_params)
+    clf_f.fit(X_tr, y_tr_bin)
+
+    # Stage 2: regressors on non-zero
+    nz_tr = y_tr > ZERO_THRESHOLD
+    X_nz_f, y_nz_f = X_tr[nz_tr], y_tr[nz_tr]
+
+    base_f = []
+    for name, template in models_config:
+        m = sklearn.base.clone(template)
+        m.fit(X_nz_f, y_nz_f)
+        base_f.append(m)
+
+    # Quick inner OOF for meta-learner
+    inner_cv = KFold(n_splits=3, shuffle=True, random_state=0)
+    oof_inner = np.zeros((X_nz_f.shape[0], len(models_config)))
+    for mi, (_, template) in enumerate(models_config):
+        for ti, vi in inner_cv.split(X_nz_f):
+            m = sklearn.base.clone(template)
+            m.fit(X_nz_f[ti], y_nz_f[ti])
+            oof_inner[vi, mi] = m.predict(X_nz_f[vi])
+    meta_f = Ridge(alpha=1.0)
+    meta_f.fit(oof_inner, y_nz_f)
+
+    # Predict val
+    proba = clf_f.predict_proba(X_vl)[:, 1]
+    pred = np.zeros(len(X_vl))
+    nz_mask = proba >= 0.5
+
+    if nz_mask.sum() > 0:
+        bp = np.column_stack([m.predict(X_vl[nz_mask]) for m in base_f])
+        pred[nz_mask] = meta_f.predict(bp)
+
+    pred = np.clip(pred, 0, 100)
+    rmse = np.sqrt(mean_squared_error(y_vl, pred))
+    fold_rmses.append(rmse)
+    y_val_all.extend(y_vl.tolist())
+    y_pred_all.extend(pred.tolist())
+    print(f"  Fold {fold+1} RMSE: {rmse:.4f}")
+
+mean_rmse = np.mean(fold_rmses)
+std_rmse = np.std(fold_rmses)
+print(f"\n{'='*50}")
+print(f">>> FINAL 5-Fold CV RMSE: {mean_rmse:.4f} +/- {std_rmse:.4f}")
+print(f"    Previous V2 RMSE:     ~18.02")
+print(f"    Original baseline:    ~21.78")
+print(f"{'='*50}")
+
+# %% [markdown]
+# ## 6. Plots
+
+# %%
+y_va = np.array(y_val_all)
+y_pa = np.array(y_pred_all)
+
 plt.figure(figsize=(8, 8))
-plt.scatter(y_val, y_val_pred, alpha=0.7, color='b')
-plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--', lw=2)
+plt.scatter(y_va, y_pa, alpha=0.6, color='steelblue', edgecolors='white', s=60)
+plt.plot([0, 100], [0, 100], 'r--', lw=2)
 plt.xlabel('True Yield')
 plt.ylabel('Predicted Yield')
-plt.title('True vs Predicted Yield (Validation Set)')
+plt.title(f'True vs Predicted (CV RMSE={mean_rmse:.2f})')
 plt.savefig('true_vs_predicted_yield.png', dpi=300)
 plt.close()
+print("Saved true_vs_predicted_yield.png")
 
-# %% [markdown]
-# ### Feature Importance
-# Let's see which features the model relies on the most. This provides Process Insight.
-
-# %%
-feature_importance = gb_model.feature_importances_
-sorted_idx = np.argsort(feature_importance)
-
-plt.figure(figsize=(10, 6))
-plt.barh(range(len(sorted_idx)), feature_importance[sorted_idx], align='center')
-plt.yticks(range(len(sorted_idx)), np.array(X.columns)[sorted_idx])
+# Feature importance
+xgb_fi = xgb.XGBRegressor(**best_xgb_params)
+xgb_fi.fit(X_nz, y_nz)
+imp = xgb_fi.feature_importances_
+si = np.argsort(imp)
+plt.figure(figsize=(10, 8))
+plt.barh(range(len(si)), imp[si], align='center')
+plt.yticks(range(len(si)), np.array(feature_names)[si])
 plt.xlabel('Feature Importance')
-plt.title('Gradient Boosting - Feature Importance')
+plt.title('XGBoost Feature Importance')
+plt.tight_layout()
 plt.savefig('feature_importance.png', dpi=300)
 plt.close()
+print("Saved feature_importance.png")
 
 # %% [markdown]
-# ## 6. Retrain on Full Data and Predict for Test Set
-# To maximize performance, we retrain the model on the entire training set before predicting on the blind test set.
+# ## 7. Generate Submission
 
 # %%
-final_model = GradientBoostingRegressor(
-    n_estimators=200,
-    learning_rate=0.05,
-    max_depth=4,
-    random_state=42,
-    subsample=0.8
-)
-final_model.fit(X, y)
+proba_test = clf.predict_proba(X_test_final)[:, 1]
+pred_test = np.zeros(len(X_test_final))
+nz_test = proba_test >= 0.5
 
-# Predict on test set
-final_predictions = final_model.predict(X_test_final)
+if nz_test.sum() > 0:
+    bp_test = np.column_stack([m.predict(X_test_final[nz_test]) for _, m in final_models])
+    pred_test[nz_test] = meta.predict(bp_test)
 
-# %% [markdown]
-# ## 7. Prepare Submission File
-# Generate the submission CSV containing exactly 50 rows and one column `overall_yield`, rounded to 3 decimal places.
+pred_test = np.clip(pred_test, 0, 100)
 
-# %%
-submission = pd.DataFrame({'overall_yield': np.round(final_predictions, 3)})
+submission = pd.DataFrame({'overall_yield': np.round(pred_test, 3)})
 submission.to_csv('Ctrl+Alt+Achieve.csv', index=False)
-
-print("Submission saved successfully as Ctrl+Alt+Achieve.csv!")
-print(submission.head())
+print("\nSubmission saved as Ctrl+Alt+Achieve.csv!")
+print(submission)
+print(f"\n{(pred_test == 0).sum()} zeros, {(pred_test > 0).sum()} non-zeros")

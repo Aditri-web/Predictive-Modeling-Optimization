@@ -5,9 +5,9 @@ This repository contains the solution for the **ML Hackathon: The Predictive Mod
 ## Project Structure
 
 - **`eda.ipynb` / `eda.py`**: Exploratory Data Analysis (EDA). This step includes loading the data, visualizing distributions, analyzing bivariate relationships, and generating a correlation matrix to understand the underlying thermodynamic and kinetic behaviors.
-- **`train.ipynb` / `train.py`**: Model training and evaluation. We used a **Gradient Boosting Regressor** to predict the target (`overall_yield`). The code includes data splitting, model training, evaluation (RMSE), feature importance extraction, and generating final predictions on the unseen test dataset.
+- **`train.ipynb` / `train.py`**: Model training and evaluation. We adopted a Physics-Informed ML approach using **Extra Trees, Gaussian Process, and SVR** regressors to predict the target (`overall_yield`). The code includes physics-based feature engineering (Arrhenius terms, residence time), model training, evaluation (RMSE), feature importance extraction, bounding predictions to [0, 100], and generating final predictions on the unseen test dataset.
 - **`Ctrl+Alt+Achieve.csv`**: The final prediction submission file formatted strictly according to the hackathon guidelines (50 rows, 1 column: `overall_yield`, rounded to 3 decimal places).
-- **`pitch_and_evaluation_notes.md`**: A detailed document outlining our approach for Phase 2, covering our quantitative validation (RMSE), process insights, feature engineering innovations, and strategies for model robustness and scalability.
+- **`pitch_and_evaluation_notes.md`**: A detailed document outlining our approach for Phase 2, covering our quantitative validation (RMSE), process insights (physics features), feature engineering innovations, and strategies for model robustness and scalability.
 - **`train_dataset.csv` & `test_dataset.csv`**: The historical plant data provided for training and the unseen data for generating final predictions.
 - **`*.png`**: Various plots generated during EDA and model evaluation, such as feature importance and correlation matrices.
 
@@ -31,6 +31,6 @@ This repository contains the solution for the **ML Hackathon: The Predictive Mod
 
 ## Model Highlights
 
-- **Algorithm:** Gradient Boosting Regressor (XGBoost/GBM)
-- **Validation RMSE:** ~20.30
-- **Why Gradient Boosting?** It naturally captures the non-linear interaction effects (e.g., how flow rate and jacket temperature interact) typical of chemical kinetic systems, without requiring manual polynomial feature engineering. We prevented overfitting on the small dataset by restricting tree depth and using stochastic subsetting.
+- **Algorithm:** Physics-Informed Ensemble (Extra Trees + Gaussian Process + SVR)
+- **Validation RMSE:** ~20.12
+- **Why Smooth Regressors?** Standard tree boosting creates step-functions that poorly mimic chemical kinetics. By introducing explicit physics terms (like $e^{-C/T}$) and relying on models like Gaussian Processes and SVR, we smoothly map the bounded continuous output surface without breaking physical laws (strictly clipping between 0% and 100% yield).

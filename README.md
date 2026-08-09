@@ -32,5 +32,5 @@ This repository contains the solution for the **ML Hackathon: The Predictive Mod
 ## Model Highlights
 
 - **Algorithm:** Gradient Boosting Regressor (XGBoost/GBM)
-- **Validation RMSE:** ~21.78
+- **Validation RMSE:** ~20.30
 - **Why Gradient Boosting?** It naturally captures the non-linear interaction effects (e.g., how flow rate and jacket temperature interact) typical of chemical kinetic systems, without requiring manual polynomial feature engineering. We prevented overfitting on the small dataset by restricting tree depth and using stochastic subsetting.

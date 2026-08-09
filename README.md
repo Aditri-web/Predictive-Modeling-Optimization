@@ -26,9 +26,9 @@ This repository contains the solution for the **ML Hackathon: The Predictive Mod
 ## Model Highlights
 
 - **Algorithm:** Two-Stage Stacking Ensemble (XGBoost + LightGBM + ExtraTrees + GBR → Ridge Meta-Learner)
-- **Validation RMSE (5-Fold CV):** ~13.80
-- **Previous V2 RMSE:** ~18.02 → **~23% improvement**
-- **Original Baseline RMSE:** ~21.78 → **~37% total reduction**
+- **Validation RMSE (5-Fold CV):** ~12.71
+- **Previous V2 RMSE:** ~18.02 → **~29% improvement**
+- **Original Baseline RMSE:** ~21.78 → **~42% total reduction**
 
 ### Pipeline Summary
 

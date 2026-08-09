@@ -23,10 +23,12 @@ This repository contains the solution for the **ML Hackathon: The Predictive Mod
    jupyter notebook train.ipynb
    ```
 
-## Model Architecture (V3)
+## Model Highlights
 
+- **Algorithm:** Two-Stage Stacking Ensemble (XGBoost + LightGBM + ExtraTrees + GBR → Ridge Meta-Learner)
 - **Validation RMSE (5-Fold CV):** ~14.07 ± 2.23
-- **Previous baseline:** ~21.78 → **40% RMSE reduction**
+- **Previous V2 RMSE:** ~18.02 → **~22% improvement**
+- **Original Baseline RMSE:** ~21.78 → **~40% total reduction**
 
 ### Pipeline Summary
 
